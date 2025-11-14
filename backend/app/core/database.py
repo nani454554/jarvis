@@ -1,6 +1,6 @@
 """
-Database Configuration with SQLAlchemy 2.0
-Async support for better performance
+Database Configuration and Session Management
+SQLAlchemy 2.0 with async support
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
@@ -10,12 +10,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Convert sync URL to async
-database_url = str(settings.DATABASE_URL).replace("postgresql://", "postgresql+asyncpg://")
-
 # Create async engine
 engine = create_async_engine(
-    database_url,
+    settings.DATABASE_URL,
     echo=settings.DB_ECHO,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
@@ -37,7 +34,9 @@ class Base(DeclarativeBase):
     pass
 
 async def get_db() -> AsyncSession:
-    """Dependency for database sessions"""
+    """
+    Dependency for database sessions
+    """
     async with SessionLocal() as session:
         try:
             yield session
@@ -47,3 +46,18 @@ async def get_db() -> AsyncSession:
             raise
         finally:
             await session.close()
+
+async def init_db():
+    """
+    Initialize database - create tables
+    """
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database initialized")
+
+async def close_db():
+    """
+    Close database connections
+    """
+    await engine.dispose()
+    logger.info("Database connections closed")
