@@ -1,18 +1,24 @@
 """
-Authentication API Routes
+Authentication Routes
 User registration, login, token management
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import security_manager, get_current_user
 from app.models.user import User
-from app.schemas.user import UserCreate, UserResponse, TokenResponse
+from app.schemas.user import (
+    UserCreate,
+    UserUpdate,
+    UserResponse,
+    UserLogin,
+    TokenResponse
+)
+from app.core.events import events, Events
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,6 +31,16 @@ async def register(
 ):
     """
     Register new user
+    
+    Args:
+        user_data: User registration data
+        db: Database session
+        
+    Returns:
+        Created user
+        
+    Raises:
+        HTTPException: If username or email already exists
     """
     try:
         # Check if user exists
@@ -35,10 +51,16 @@ async def register(
         existing_user = result.scalar_one_or_none()
         
         if existing_user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username or email already registered"
-            )
+            if existing_user.username == user_data.username:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Username already registered"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already registered"
+                )
         
         # Create new user
         hashed_password = security_manager.hash_password(user_data.password)
@@ -51,7 +73,12 @@ async def register(
             preferences={
                 "theme": "dark",
                 "voice_enabled": True,
-                "camera_enabled": True
+                "camera_enabled": True,
+                "notifications": True
+            },
+            settings={
+                "language": "en",
+                "timezone": "UTC"
             }
         )
         
@@ -61,12 +88,19 @@ async def register(
         
         logger.info(f"✅ New user registered: {new_user.username}")
         
-        return UserResponse.from_orm(new_user)
+        # Publish event
+        await events.publish(Events.USER_REGISTERED, {
+            "user_id": new_user.id,
+            "username": new_user.username
+        })
+        
+        return UserResponse.model_validate(new_user)
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Registration error: {e}")
+        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Registration failed"
@@ -74,15 +108,28 @@ async def register(
 
 @router.post("/login", response_model=TokenResponse)
 async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
+    credentials: UserLogin,
     db: AsyncSession = Depends(get_db)
 ):
     """
     User login - returns access and refresh tokens
+    
+    Args:
+        credentials: Login credentials
+        db: Database session
+        
+    Returns:
+        Access token, refresh token, and user info
+        
+    Raises:
+        HTTPException: If credentials are invalid
     """
     try:
-        # Find user
-        stmt = select(User).where(User.username == form_data.username)
+        # Find user by username or email
+        stmt = select(User).where(
+            (User.username == credentials.username) | 
+            (User.email == credentials.username)
+        )
         result = await db.execute(stmt)
         user = result.scalar_one_or_none()
         
@@ -93,7 +140,10 @@ async def login(
             )
         
         # Verify password
-        if not security_manager.verify_password(form_data.password, user.hashed_password):
+        if not security_manager.verify_password(
+            credentials.password,
+            user.hashed_password
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect username or password"
@@ -125,11 +175,16 @@ async def login(
         
         logger.info(f"✅ User logged in: {user.username}")
         
+        # Publish event
+        await events.publish(Events.USER_LOGIN, {
+            "user_id": user.id,
+            "username": user.username
+        })
+        
         return TokenResponse(
             access_token=access_token,
             refresh_token=refresh_token,
-            token_type="bearer",
-            user=UserResponse.from_orm(user)
+            user=UserResponse.model_validate(user)
         )
         
     except HTTPException:
@@ -148,6 +203,13 @@ async def refresh_token(
 ):
     """
     Refresh access token using refresh token
+    
+    Args:
+        refresh_token: Refresh token
+        db: Database session
+        
+    Returns:
+        New access and refresh tokens
     """
     try:
         # Decode refresh token
@@ -188,8 +250,7 @@ async def refresh_token(
         return TokenResponse(
             access_token=new_access_token,
             refresh_token=new_refresh_token,
-            token_type="bearer",
-            user=UserResponse.from_orm(user)
+            user=UserResponse.model_validate(user)
         )
         
     except HTTPException:
@@ -208,6 +269,13 @@ async def get_current_user_info(
 ):
     """
     Get current user information
+    
+    Args:
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        User information
     """
     try:
         stmt = select(User).where(User.id == current_user["user_id"])
@@ -220,7 +288,7 @@ async def get_current_user_info(
                 detail="User not found"
             )
         
-        return UserResponse.from_orm(user)
+        return UserResponse.model_validate(user)
         
     except HTTPException:
         raise
@@ -231,12 +299,130 @@ async def get_current_user_info(
             detail="Failed to get user"
         )
 
+@router.put("/me", response_model=UserResponse)
+async def update_current_user(
+    user_update: UserUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Update current user profile
+    
+    Args:
+        user_update: User update data
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        Updated user information
+    """
+    try:
+        stmt = select(User).where(User.id == current_user["user_id"])
+        result = await db.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Update fields
+        update_data = user_update.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(user, field, value)
+        
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info(f"✅ User updated: {user.username}")
+        
+        return UserResponse.model_validate(user)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Update user error: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update user"
+        )
+
 @router.post("/logout")
 async def logout(
     current_user: dict = Depends(get_current_user)
 ):
     """
     Logout user (client should delete tokens)
+    
+    Args:
+        current_user: Current authenticated user
+        
+    Returns:
+        Success message
     """
     logger.info(f"User logged out: {current_user['username']}")
+    
+    # Publish event
+    await events.publish(Events.USER_LOGOUT, {
+        "user_id": current_user["user_id"],
+        "username": current_user["username"]
+    })
+    
     return {"message": "Successfully logged out"}
+
+@router.post("/change-password")
+async def change_password(
+    old_password: str,
+    new_password: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Change user password
+    
+    Args:
+        old_password: Current password
+        new_password: New password
+        current_user: Current authenticated user
+        db: Database session
+        
+    Returns:
+        Success message
+    """
+    try:
+        stmt = select(User).where(User.id == current_user["user_id"])
+        result = await db.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Verify old password
+        if not security_manager.verify_password(old_password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password"
+            )
+        
+        # Update password
+        user.hashed_password = security_manager.hash_password(new_password)
+        await db.commit()
+        
+        logger.info(f"✅ Password changed for user: {user.username}")
+        
+        return {"message": "Password changed successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Change password error: {e}")
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password"
+        )
