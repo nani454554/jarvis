@@ -1,8 +1,8 @@
 """
 WebSocket API Route
-Real-time bidirectional communication
+Real-time bidirectional communication handler
 """
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from typing import Optional
 import json
 import uuid
@@ -10,9 +10,8 @@ import logging
 from datetime import datetime
 
 from app.core.websocket import manager
-from app.services.voice_service import VoiceService
-from app.services.vision_service import VisionService
-from app.services.brain_service import BrainService
+from app.core.security import security_manager
+from app.dependencies import get_voice_service, get_vision_service, get_brain_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -20,10 +19,7 @@ router = APIRouter()
 @router.websocket("/connect")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None),
-    voice_service: VoiceService = Depends(lambda: VoiceService()),
-    vision_service: VisionService = Depends(lambda: VisionService()),
-    brain_service: BrainService = Depends(lambda: BrainService())
+    token: Optional[str] = Query(None)
 ):
     """
     Main WebSocket endpoint for real-time communication
@@ -33,33 +29,64 @@ async def websocket_endpoint(
     - Camera feed processing
     - Real-time responses
     - System updates
+    - Bidirectional streaming
+    
+    Args:
+        websocket: WebSocket connection
+        token: Optional JWT token for authentication
     """
     connection_id = str(uuid.uuid4())
     user_id = None
+    username = "guest"
     
     try:
         # Validate token if provided
         if token:
-            from app.core.security import security_manager
             try:
                 payload = security_manager.decode_token(token)
                 user_id = payload.get("sub")
+                username = payload.get("username", "user")
             except Exception as e:
                 logger.warning(f"Invalid token in WebSocket: {e}")
         
         # Accept connection
-        await manager.connect(websocket, connection_id, user_id)
+        await manager.connect(
+            websocket,
+            connection_id,
+            user_id,
+            metadata={
+                "username": username,
+                "connected_at": datetime.utcnow().isoformat()
+            }
+        )
         
         # Send welcome message
         await manager.send_message(connection_id, {
             "type": "system",
             "event": "connected",
             "message": "Connection established. J.A.R.V.I.S. online.",
-            "connection_id": connection_id
+            "connection_id": connection_id,
+            "username": username
         })
         
         # Join default room
         await manager.join_room(connection_id, "main")
+        
+        # Get services (lazy loading)
+        voice_service = None
+        vision_service = None
+        brain_service = None
+        
+        try:
+            from app.main import app
+            if hasattr(app.state, "voice_service"):
+                voice_service = app.state.voice_service
+            if hasattr(app.state, "vision_service"):
+                vision_service = app.state.vision_service
+            if hasattr(app.state, "brain_service"):
+                brain_service = app.state.brain_service
+        except:
+            pass
         
         # Message handling loop
         while True:
@@ -67,7 +94,7 @@ async def websocket_endpoint(
             data = await websocket.receive_json()
             message_type = data.get("type")
             
-            logger.debug(f"WebSocket message: {message_type}")
+            logger.debug(f"WebSocket [{connection_id}] received: {message_type}")
             
             # Handle different message types
             if message_type == "ping":
@@ -118,6 +145,16 @@ async def websocket_endpoint(
                         "room": room
                     })
             
+            elif message_type == "broadcast":
+                # Broadcast to room
+                room = data.get("room", "main")
+                message = data.get("message", {})
+                await manager.send_to_room(room, {
+                    "type": "broadcast",
+                    "from": username,
+                    "message": message
+                })
+            
             else:
                 logger.warning(f"Unknown message type: {message_type}")
                 await manager.send_message(connection_id, {
@@ -135,7 +172,7 @@ async def websocket_endpoint(
             await manager.send_message(connection_id, {
                 "type": "error",
                 "message": "An error occurred",
-                "details": str(e)
+                "details": str(e) if logger.level == logging.DEBUG else None
             })
         except:
             pass
@@ -145,8 +182,8 @@ async def handle_voice_command(
     connection_id: str,
     data: dict,
     user_id: Optional[str],
-    brain_service: BrainService,
-    voice_service: VoiceService
+    brain_service,
+    voice_service
 ):
     """Handle voice command from WebSocket"""
     try:
@@ -160,24 +197,39 @@ async def handle_voice_command(
             return
         
         # Process with brain
-        result = await brain_service.process_command(
-            text=text,
-            user_id=user_id or "anonymous",
-            context=data.get("context")
-        )
-        
-        # Generate speech
-        audio_bytes = await voice_service.text_to_speech(result["text"])
-        
-        # Send response
-        import base64
-        await manager.send_message(connection_id, {
-            "type": "voice_response",
-            "text": result["text"],
-            "intent": result["intent"],
-            "audio": base64.b64encode(audio_bytes).decode() if audio_bytes else None,
-            "actions": result.get("actions", [])
-        })
+        if brain_service:
+            result = await brain_service.process_command(
+                text=text,
+                user_id=user_id or "anonymous",
+                context=data.get("context")
+            )
+            
+            # Generate speech if voice service available
+            audio_data = None
+            if voice_service:
+                try:
+                    audio_bytes = await voice_service.text_to_speech(result["text"])
+                    if audio_bytes:
+                        import base64
+                        audio_data = base64.b64encode(audio_bytes).decode()
+                except Exception as e:
+                    logger.error(f"TTS error: {e}")
+            
+            # Send response
+            await manager.send_message(connection_id, {
+                "type": "voice_response",
+                "text": result["text"],
+                "intent": result["intent"],
+                "audio": audio_data,
+                "actions": result.get("actions", []),
+                "confidence": result["confidence"]
+            })
+        else:
+            await manager.send_message(connection_id, {
+                "type": "voice_response",
+                "text": "Brain service not available. Running in limited mode.",
+                "intent": "system_message"
+            })
         
     except Exception as e:
         logger.error(f"Voice command error: {e}")
@@ -190,13 +242,13 @@ async def handle_voice_command(
 async def handle_camera_frame(
     connection_id: str,
     data: dict,
-    vision_service: VisionService
+    vision_service
 ):
     """Handle camera frame from WebSocket"""
     try:
         frame_data = data.get("frame")
         
-        if not frame_data:
+        if not frame_data or not vision_service:
             return
         
         # Decode base64 image
@@ -209,10 +261,10 @@ async def handle_camera_frame(
         # Detect faces
         faces = await vision_service.detect_faces(image_bytes)
         
-        # Recognize if faces found
+        # Recognize faces if detected
         recognition_results = []
         if faces:
-            for face in faces:
+            for face in faces[:3]:  # Limit to 3 faces for performance
                 recognition = await vision_service.recognize_face(
                     image_bytes,
                     bbox=face["bbox"]
@@ -220,14 +272,17 @@ async def handle_camera_frame(
                 recognition_results.append(recognition)
         
         # Detect emotion
-        emotion = await vision_service.detect_emotion(image_bytes)
+        emotion = None
+        if faces:
+            emotion = await vision_service.detect_emotion(image_bytes)
         
         # Send results
         await manager.send_message(connection_id, {
             "type": "vision_update",
             "faces": faces,
             "recognition": recognition_results,
-            "emotion": emotion
+            "emotion": emotion,
+            "timestamp": datetime.utcnow().isoformat()
         })
         
     except Exception as e:
@@ -236,8 +291,8 @@ async def handle_camera_frame(
 async def handle_audio_chunk(
     connection_id: str,
     data: dict,
-    voice_service: VoiceService,
-    brain_service: BrainService,
+    voice_service,
+    brain_service,
     user_id: Optional[str]
 ):
     """Handle audio chunk for real-time STT"""
@@ -245,7 +300,7 @@ async def handle_audio_chunk(
         audio_data = data.get("audio")
         is_final = data.get("is_final", False)
         
-        if not audio_data:
+        if not audio_data or not voice_service:
             return
         
         # Decode base64 audio
