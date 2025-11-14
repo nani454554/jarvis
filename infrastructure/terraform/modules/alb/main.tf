@@ -254,4 +254,22 @@ resource "aws_cloudwatch_metric_alarm" "target_response_time" {
   tags = var.tags
 }
 
-resource "aws_cloudwatch_metric_alarm" "http_5xx" 
+resource "aws_cloudwatch_metric_alarm" "http_5xx" {
+  alarm_name          = "${var.project_name}-${var.environment}-alb-5xx-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  namespace           = "AWS/ApplicationELB"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 10
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  alarm_description = "ALB is returning 5XX errors"
+  alarm_actions     = var.alarm_sns_topic_arn != null ? [var.alarm_sns_topic_arn] : []
+
+  tags = var.tags
+}
