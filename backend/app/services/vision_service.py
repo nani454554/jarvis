@@ -1,40 +1,42 @@
 """
-Voice Service
-Handles STT, TTS, Wake Word Detection, Voice Cloning
+Vision Service
+Face Detection, Recognition, Emotion Analysis, Gesture Recognition
 """
 import asyncio
-import io
-import wave
+import cv2
 import numpy as np
-from typing import Optional, AsyncGenerator
+from typing import List, Dict, Optional, Tuple
 import logging
 from pathlib import Path
 import base64
+from io import BytesIO
+from PIL import Image
 
-# Whisper for STT
-import whisper
+# Face detection and recognition
+from facenet_pytorch import MTCNN, InceptionResnetV1
+import torch
 
-# TTS imports
-from TTS.api import TTS
-
-# Audio processing
-import sounddevice as sd
-import scipy.io.wavfile as wavfile
+# Emotion detection
+from fer import FER
 
 from app.config import settings
 from app.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
-class VoiceService:
-    """Advanced voice processing service"""
+class VisionService:
+    """Advanced computer vision service"""
     
     def __init__(self):
-        self.stt_model = None
-        self.tts_model = None
-        self.wake_word_detector = None
+        self.face_detector = None
+        self.face_recognizer = None
+        self.emotion_detector = None
+        self.device = None
         self.is_initialized = False
         self._lock = asyncio.Lock()
+        
+        # Known faces database (in-memory, should use DB in production)
+        self.known_faces = {}
         
         # Initialize in background
         asyncio.create_task(self._initialize())
@@ -43,247 +45,287 @@ class VoiceService:
         """Initialize AI models"""
         async with self._lock:
             try:
-                logger.info("🎤 Initializing Voice Service...")
+                logger.info("👁️ Initializing Vision Service...")
                 
-                # Load Whisper STT model
-                logger.info(f"Loading Whisper model: {settings.WHISPER_MODEL}")
-                self.stt_model = whisper.load_model(settings.WHISPER_MODEL)
+                # Set device
+                self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                logger.info(f"Using device: {self.device}")
                 
-                # Load TTS model
-                logger.info(f"Loading TTS model: {settings.TTS_MODEL}")
-                self.tts_model = TTS(settings.TTS_MODEL)
+                # Initialize face detector (MTCNN)
+                logger.info("Loading MTCNN face detector...")
+                self.face_detector = MTCNN(
+                    keep_all=True,
+                    device=self.device,
+                    post_process=False
+                )
                 
-                # Set default speaker for multi-speaker models
-                if self.tts_model.speakers:
-                    # Choose British-sounding speaker
-                    british_speakers = [s for s in self.tts_model.speakers if 'p' in s.lower()]
-                    if british_speakers:
-                        self.default_speaker = british_speakers[0]
-                    else:
-                        self.default_speaker = self.tts_model.speakers[0]
-                else:
-                    self.default_speaker = None
+                # Initialize face recognizer (FaceNet)
+                logger.info("Loading FaceNet recognizer...")
+                self.face_recognizer = InceptionResnetV1(
+                    pretrained='vggface2'
+                ).eval().to(self.device)
+                
+                # Initialize emotion detector
+                logger.info("Loading emotion detector...")
+                self.emotion_detector = FER(mtcnn=True)
                 
                 self.is_initialized = True
-                logger.info("✅ Voice Service initialized successfully")
+                logger.info("✅ Vision Service initialized successfully")
                 
             except Exception as e:
-                logger.error(f"❌ Failed to initialize Voice Service: {e}")
+                logger.error(f"❌ Failed to initialize Vision Service: {e}")
                 self.is_initialized = False
     
-    async def speech_to_text(
+    async def detect_faces(
         self,
-        audio_data: bytes,
-        language: str = "en"
-    ) -> dict:
+        image_data: bytes
+    ) -> List[Dict]:
         """
-        Convert speech to text using Whisper
+        Detect all faces in image
         
         Args:
-            audio_data: Raw audio bytes (WAV format)
-            language: Language code (default: en)
+            image_data: Image bytes (JPEG/PNG)
         
         Returns:
-            dict with transcription and metadata
+            List of detected faces with bounding boxes
         """
         if not self.is_initialized:
-            raise RuntimeError("Voice service not initialized")
+            raise RuntimeError("Vision service not initialized")
         
         try:
-            # Check cache first
-            cache_key = f"stt:{hash(audio_data)}"
-            cached = await cache.get(cache_key)
-            if cached:
-                logger.debug("STT cache hit")
-                return cached
+            # Decode image
+            image = self._decode_image(image_data)
             
-            # Convert bytes to numpy array
-            audio_io = io.BytesIO(audio_data)
-            sample_rate, audio_np = wavfile.read(audio_io)
+            # Convert to RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             
-            # Normalize to float32
-            audio_np = audio_np.astype(np.float32) / 32768.0
+            # Detect faces
+            logger.debug("Detecting faces...")
+            boxes, probs, landmarks = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.face_detector.detect(image_rgb, landmarks=True)
+            )
             
-            # Transcribe
-            logger.info("Transcribing audio with Whisper...")
+            if boxes is None:
+                return []
+            
+            faces = []
+            for i, (box, prob, landmark) in enumerate(zip(boxes, probs, landmarks)):
+                faces.append({
+                    "id": f"face_{i}",
+                    "bbox": box.tolist(),
+                    "confidence": float(prob),
+                    "landmarks": landmark.tolist() if landmark is not None else None
+                })
+            
+            logger.info(f"Detected {len(faces)} face(s)")
+            return faces
+            
+        except Exception as e:
+            logger.error(f"Face detection error: {e}")
+            return []
+    
+    async def recognize_face(
+        self,
+        image_data: bytes,
+        bbox: Optional[List[float]] = None
+    ) -> Dict:
+        """
+        Recognize face and return identity
+        
+        Args:
+            image_data: Image bytes
+            bbox: Optional bounding box [x1, y1, x2, y2]
+        
+        Returns:
+            Recognition result with identity and confidence
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Vision service not initialized")
+        
+        try:
+            # Decode image
+            image = self._decode_image(image_data)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Extract face
+            if bbox:
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                face_image = image_rgb[y1:y2, x1:x2]
+            else:
+                # Detect face first
+                faces = await self.detect_faces(image_data)
+                if not faces:
+                    return {"identity": "unknown", "confidence": 0.0}
+                
+                bbox = faces[0]["bbox"]
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                face_image = image_rgb[y1:y2, x1:x2]
+            
+            # Get face embedding
+            embedding = await self._get_face_embedding(face_image)
+            
+            # Compare with known faces
+            best_match = None
+            best_distance = float('inf')
+            
+            for user_id, known_embedding in self.known_faces.items():
+                distance = np.linalg.norm(embedding - known_embedding)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_match = user_id
+            
+            # Determine if match is confident enough
+            threshold = settings.FACE_RECOGNITION_THRESHOLD
+            if best_match and best_distance < threshold:
+                confidence = 1.0 - (best_distance / threshold)
+                return {
+                    "identity": best_match,
+                    "confidence": float(confidence),
+                    "distance": float(best_distance)
+                }
+            else:
+                return {
+                    "identity": "unknown",
+                    "confidence": 0.0,
+                    "distance": float(best_distance) if best_match else None
+                }
+            
+        except Exception as e:
+            logger.error(f"Face recognition error: {e}")
+            return {"identity": "unknown", "confidence": 0.0, "error": str(e)}
+    
+    async def detect_emotion(
+        self,
+        image_data: bytes
+    ) -> Dict:
+        """
+        Detect emotion from facial expression
+        
+        Args:
+            image_data: Image bytes
+        
+        Returns:
+            Emotion classification results
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Vision service not initialized")
+        
+        try:
+            # Decode image
+            image = self._decode_image(image_data)
+            
+            # Detect emotions
+            logger.debug("Detecting emotions...")
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: self.stt_model.transcribe(
-                    audio_np,
-                    language=language,
-                    fp16=False
-                )
+                lambda: self.emotion_detector.detect_emotions(image)
             )
             
-            response = {
-                "text": result["text"].strip(),
-                "language": result.get("language", language),
-                "segments": result.get("segments", []),
-                "confidence": self._calculate_confidence(result)
+            if not result:
+                return {"emotion": "neutral", "confidence": 0.0, "all_emotions": {}}
+            
+            # Get dominant emotion
+            emotions = result[0]["emotions"]
+            dominant_emotion = max(emotions.items(), key=lambda x: x[1])
+            
+            return {
+                "emotion": dominant_emotion[0],
+                "confidence": float(dominant_emotion[1]),
+                "all_emotions": {k: float(v) for k, v in emotions.items()}
             }
             
-            # Cache result
-            await cache.set(cache_key, response, expire=3600)
-            
-            logger.info(f"STT Result: {response['text']}")
-            return response
-            
         except Exception as e:
-            logger.error(f"STT error: {e}")
-            raise
+            logger.error(f"Emotion detection error: {e}")
+            return {"emotion": "neutral", "confidence": 0.0, "error": str(e)}
     
-    async def text_to_speech(
+    async def register_face(
         self,
-        text: str,
-        speaker: Optional[str] = None,
-        language: str = "en",
-        emotion: str = "neutral"
-    ) -> bytes:
-        """
-        Convert text to speech with JARVIS-like voice
-        
-        Args:
-            text: Text to synthesize
-            speaker: Speaker ID (optional)
-            language: Language code
-            emotion: Emotion/tone (neutral, urgent, calm)
-        
-        Returns:
-            Audio bytes in WAV format
-        """
-        if not self.is_initialized:
-            raise RuntimeError("Voice service not initialized")
-        
-        try:
-            # Check cache
-            cache_key = f"tts:{hash(text)}:{speaker}:{emotion}"
-            cached = await cache.get(cache_key)
-            if cached:
-                logger.debug("TTS cache hit")
-                return base64.b64decode(cached)
-            
-            logger.info(f"Synthesizing speech: {text[:50]}...")
-            
-            # Adjust text for emotion
-            text = self._apply_emotion_modulation(text, emotion)
-            
-            # Generate speech
-            speaker_id = speaker or self.default_speaker
-            
-            wav_data = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.tts_model.tts(
-                    text=text,
-                    speaker=speaker_id
-                )
-            )
-            
-            # Convert to bytes
-            audio_bytes = self._numpy_to_wav_bytes(wav_data, self.tts_model.synthesizer.output_sample_rate)
-            
-            # Cache result
-            await cache.set(cache_key, base64.b64encode(audio_bytes).decode(), expire=3600)
-            
-            return audio_bytes
-            
-        except Exception as e:
-            logger.error(f"TTS error: {e}")
-            raise
-    
-    async def detect_wake_word(
-        self,
-        audio_stream: AsyncGenerator[bytes, None]
+        user_id: str,
+        image_data: bytes
     ) -> bool:
         """
-        Detect wake word in audio stream
+        Register a new face for recognition
         
         Args:
-            audio_stream: Async generator yielding audio chunks
+            user_id: User identifier
+            image_data: Face image bytes
         
         Returns:
-            True if wake word detected
+            True if successful
         """
-        # Simplified wake word detection
-        # In production, use Porcupine or similar
-        
         try:
-            async for chunk in audio_stream:
-                # Process chunk
-                transcription = await self.speech_to_text(chunk)
-                if settings.WAKE_WORD.lower() in transcription["text"].lower():
-                    logger.info(f"Wake word '{settings.WAKE_WORD}' detected!")
-                    return True
+            # Detect face
+            faces = await self.detect_faces(image_data)
+            if not faces:
+                logger.error("No face detected in registration image")
+                return False
             
-            return False
+            # Get embedding
+            image = self._decode_image(image_data)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            bbox = faces[0]["bbox"]
+            x1, y1, x2, y2 = [int(coord) for coord in bbox]
+            face_image = image_rgb[y1:y2, x1:x2]
+            
+            embedding = await self._get_face_embedding(face_image)
+            
+            # Store embedding
+            self.known_faces[user_id] = embedding
+            
+            logger.info(f"✅ Face registered for user: {user_id}")
+            return True
             
         except Exception as e:
-            logger.error(f"Wake word detection error: {e}")
+            logger.error(f"Face registration error: {e}")
             return False
     
-    async def clone_voice(
+    async def _get_face_embedding(
         self,
-        reference_audio: bytes,
-        text: str
-    ) -> bytes:
+        face_image: np.ndarray
+    ) -> np.ndarray:
         """
-        Clone voice from reference audio
+        Get face embedding vector
         
         Args:
-            reference_audio: Reference voice sample
-            text: Text to synthesize in cloned voice
+            face_image: Cropped face image (RGB)
         
         Returns:
-            Audio bytes in cloned voice
+            Embedding vector (512-d)
         """
-        # Voice cloning using YourTTS or similar
-        # This is a placeholder for advanced implementation
+        # Resize to 160x160 (FaceNet input size)
+        face_resized = cv2.resize(face_image, (160, 160))
         
-        logger.warning("Voice cloning not fully implemented, using default TTS")
-        return await self.text_to_speech(text)
-    
-    def _calculate_confidence(self, whisper_result: dict) -> float:
-        """Calculate average confidence from Whisper segments"""
-        segments = whisper_result.get("segments", [])
-        if not segments:
-            return 0.0
+        # Convert to tensor
+        face_tensor = torch.from_numpy(face_resized).permute(2, 0, 1).float()
+        face_tensor = face_tensor.unsqueeze(0).to(self.device)
         
-        # Whisper doesn't provide confidence directly
-        # We can estimate from various factors
-        avg_logprob = np.mean([s.get("avg_logprob", -1.0) for s in segments])
-        
-        # Convert log probability to confidence (0-1)
-        confidence = np.exp(avg_logprob)
-        return min(max(confidence, 0.0), 1.0)
-    
-    def _apply_emotion_modulation(self, text: str, emotion: str) -> str:
-        """Apply SSML-like modulation for emotion"""
-        # Add prosody tags if supported by TTS
-        modulations = {
-            "urgent": {"rate": "+15%", "pitch": "+5%"},
-            "calm": {"rate": "-10%", "pitch": "-3%"},
-            "neutral": {"rate": "0%", "pitch": "0%"}
-        }
-        
-        # For now, just return text
-        # Advanced TTS models can accept SSML
-        return text
-    
-    def _numpy_to_wav_bytes(self, audio_np: np.ndarray, sample_rate: int) -> bytes:
-        """Convert numpy array to WAV bytes"""
         # Normalize
-        audio_np = np.clip(audio_np, -1.0, 1.0)
-        audio_int16 = (audio_np * 32767).astype(np.int16)
+        face_tensor = (face_tensor - 127.5) / 128.0
         
-        # Create WAV file in memory
-        buffer = io.BytesIO()
-        with wave.open(buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)  # Mono
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(audio_int16.tobytes())
+        # Get embedding
+        with torch.no_grad():
+            embedding = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.face_recognizer(face_tensor)
+            )
         
-        buffer.seek(0)
-        return buffer.read()
+        return embedding.cpu().numpy()[0]
+    
+    def _decode_image(self, image_data: bytes) -> np.ndarray:
+        """Decode image bytes to numpy array"""
+        if isinstance(image_data, str):
+            # Base64 encoded
+            if 'base64,' in image_data:
+                image_data = image_data.split('base64,')[1]
+            image_data = base64.b64decode(image_data)
+        
+        # Decode with OpenCV
+        nparr = np.frombuffer(image_data, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        return image
     
     def is_ready(self) -> bool:
         """Check if service is ready"""
