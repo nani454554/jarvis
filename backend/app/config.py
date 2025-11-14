@@ -1,12 +1,13 @@
 """
-Advanced Configuration Management
-Supports multiple environments with validation
+Configuration Management
+Environment-based settings with validation
 """
-from typing import Optional, List
+from typing import Optional, List, Any
 from pydantic_settings import BaseSettings
-from pydantic import Field, validator, PostgresDsn, RedisDsn
+from pydantic import Field, validator, field_validator
 from functools import lru_cache
 import secrets
+import os
 
 class Settings(BaseSettings):
     """Application settings with environment-based configuration"""
@@ -25,15 +26,18 @@ class Settings(BaseSettings):
     RELOAD: bool = Field(default=True, env="RELOAD")
     
     # Security
-    SECRET_KEY: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
+    SECRET_KEY: str = Field(
+        default_factory=lambda: secrets.token_urlsafe(32),
+        env="SECRET_KEY"
+    )
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 30  # 30 days
     ALGORITHM: str = "HS256"
-    ALLOWED_HOSTS: List[str] = ["*"]
+    ALLOWED_HOSTS: List[str] = Field(default=["*"])
     
     # Database
-    DATABASE_URL: PostgresDsn = Field(
-        default="postgresql://jarvis:jarvis123@localhost:5432/jarvis_db",
+    DATABASE_URL: str = Field(
+        default="postgresql+asyncpg://jarvis:jarvis123@localhost:5432/jarvis_db",
         env="DATABASE_URL"
     )
     DB_POOL_SIZE: int = 20
@@ -41,7 +45,7 @@ class Settings(BaseSettings):
     DB_ECHO: bool = False
     
     # Redis
-    REDIS_URL: RedisDsn = Field(
+    REDIS_URL: str = Field(
         default="redis://localhost:6379/0",
         env="REDIS_URL"
     )
@@ -98,34 +102,45 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO", env="LOG_LEVEL")
     
     # CORS
-    CORS_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://jarvis.yourdomain.com"
-    ]
+    CORS_ORIGINS: List[str] = Field(
+        default=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+    )
     
     # Rate Limiting
     RATE_LIMIT_REQUESTS: int = 100
     RATE_LIMIT_PERIOD: int = 60  # seconds
     
-    @validator("ENVIRONMENT")
+    @field_validator("ENVIRONMENT")
+    @classmethod
     def validate_environment(cls, v):
-        allowed = ["development", "staging", "production"]
+        allowed = ["development", "staging", "production", "test"]
         if v not in allowed:
             raise ValueError(f"ENVIRONMENT must be one of {allowed}")
         return v
     
-    @validator("LOG_LEVEL")
+    @field_validator("LOG_LEVEL")
+    @classmethod
     def validate_log_level(cls, v):
         allowed = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         if v.upper() not in allowed:
             raise ValueError(f"LOG_LEVEL must be one of {allowed}")
         return v.upper()
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-        extra = "allow"
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
+    
+    model_config = {
+        "env_file": ".env",
+        "case_sensitive": True,
+        "extra": "allow"
+    }
 
 @lru_cache()
 def get_settings() -> Settings:
