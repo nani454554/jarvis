@@ -1,17 +1,23 @@
 """
-Database Models
-SQLAlchemy ORM models for JARVIS
+Database models.
+Import all models here for Alembic to detect them.
 """
+
+from app.models.base import Base
 from app.models.user import User
-from app.models.conversation import Conversation
-from app.models.memory import Memory
-from app.models.face import Face
-from app.models.skill import Skill
+from app.models.conversation import Conversation, Message
+from app.models.face import FaceEncoding
+from app.models.memory import Document, DocumentChunk
+from app.models.skill import Skill, SkillExecution
 
 __all__ = [
+    "Base",
     "User",
     "Conversation",
-    "Memory",
-    "Face",
+    "Message",
+    "FaceEncoding",
+    "Document",
+    "DocumentChunk",
     "Skill",
+    "SkillExecution",
 ]
